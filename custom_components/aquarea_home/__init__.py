@@ -12,7 +12,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import AquareaHomeClient, AquareaHomeError, AuthError
+from .api import AquareaHomeClient, AuthError
 from .const import DOMAIN, STREAM_HEALTHY_POLL_SECONDS, UPDATE_INTERVAL_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +35,9 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
         # flight must win over the poll's older snapshot, per field
         self._event_seq = 0
         self._last_events: dict[str, dict[str, tuple[int, object]]] = {}
+        # transient-blip tolerance: the backend drops the odd poll
+        self._poll_failures = 0
+        self._stream_up = False
 
     # -- push event stream ---------------------------------------------
 
@@ -77,6 +80,7 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
                     if not connected:
                         connected = True
                         backoff = 5
+                        self._stream_up = True
                         self.update_interval = timedelta(
                             seconds=STREAM_HEALTHY_POLL_SECONDS)
                         _LOGGER.debug("event stream up for %s", mac)
@@ -93,6 +97,7 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
                 return
             except Exception as err:  # noqa: BLE001 — any transport error
                 _LOGGER.debug("event stream for %s dropped: %s", mac, err)
+            self._stream_up = False
             self.update_interval = timedelta(seconds=UPDATE_INTERVAL_SECONDS)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 300)
@@ -100,15 +105,27 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> dict[str, dict]:
         start_seq = self._event_seq
         data: dict[str, dict] = {}
-        for dev in self.devices:
-            try:
+        try:
+            for dev in self.devices:
                 data[dev["mac"]] = await self.client.get_status(dev["mac"])
-            except AuthError as err:
-                raise ConfigEntryAuthFailed from err
-            except AquareaHomeError as err:
-                raise UpdateFailed(str(err)) from err
-            except Exception as err:  # noqa: BLE001 — grpc transport errors
+        except AuthError as err:
+            raise ConfigEntryAuthFailed from err
+        except Exception as err:  # noqa: BLE001 — grpc transport errors
+            # the backend drops the odd poll (deadline exceeded); one miss
+            # shouldn't flip entities unavailable. Grace one cycle on stale
+            # data and retry fast; two consecutive misses = genuinely down.
+            self._poll_failures += 1
+            self.update_interval = timedelta(seconds=UPDATE_INTERVAL_SECONDS)
+            if self._poll_failures >= 2 or not self.data:
                 raise UpdateFailed(f"gRPC error: {err}") from err
+            _LOGGER.warning(
+                "status poll failed (%s); keeping last data, retrying in %ss",
+                err, UPDATE_INTERVAL_SECONDS)
+            return self.data
+        self._poll_failures = 0
+        self.update_interval = timedelta(
+            seconds=STREAM_HEALTHY_POLL_SECONDS if self._stream_up
+            else UPDATE_INTERVAL_SECONDS)
         # overlay events that arrived while the poll was in flight — they
         # are newer than the snapshot and must not be overwritten
         for mac, fields in self._last_events.items():
