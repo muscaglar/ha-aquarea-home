@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Aquarea Home account",
+        "description": "Sign in with the email and password you use in the Aquarea Home app.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Could not reach the Aquarea Home cloud"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  }
+}
