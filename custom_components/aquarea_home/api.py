@@ -6,6 +6,7 @@ in the project repository.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -17,7 +18,12 @@ import aiohttp
 from grpclib.client import Channel
 from grpclib.const import Cardinality
 
-from .const import GRPC_HOST, GRPC_PORT, REST_BASE
+from .const import (
+    GRPC_HOST,
+    GRPC_PORT,
+    REST_BASE,
+    STREAM_IDLE_TIMEOUT_SECONDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -176,6 +182,7 @@ class AquareaHomeClient:
         self._token: str | None = None
         self._token_exp: float = 0
         self._channel: Channel | None = None
+        self._stream_channel: Channel | None = None
 
     # ---------------- REST ----------------
 
@@ -242,10 +249,23 @@ class AquareaHomeClient:
             self._channel = Channel(GRPC_HOST, GRPC_PORT, ssl=True)
         return self._channel
 
-    def close(self) -> None:
+    def _get_stream_channel(self) -> Channel:
+        # event streams get their own channel: a unary error must never
+        # tear down the connection under a live subscription
+        if self._stream_channel is None:
+            self._stream_channel = Channel(GRPC_HOST, GRPC_PORT, ssl=True)
+        return self._stream_channel
+
+    def _close_unary_channel(self) -> None:
         if self._channel is not None:
             self._channel.close()
             self._channel = None
+
+    def close(self) -> None:
+        self._close_unary_channel()
+        if self._stream_channel is not None:
+            self._stream_channel.close()
+            self._stream_channel = None
 
     async def _unary(self, method: str, payload: bytes, mac: str) -> bytes:
         token = await self._ensure_token()
@@ -259,13 +279,46 @@ class AquareaHomeClient:
                 reply = await stream.recv_message()
                 return reply.data if reply else b""
         except Exception:
-            # drop a possibly-wedged channel so the next call reconnects
-            self.close()
+            # drop a possibly-wedged unary channel so the next call
+            # reconnects; the stream channel is deliberately untouched
+            self._close_unary_channel()
             raise
 
     async def get_status(self, mac: str) -> dict[str, Any]:
         raw = await self._unary("/device_controls.Controls/GetDeviceStatus", b"", mac)
         return parse_status(raw)
+
+    async def subscribe_events(self, mac: str):
+        """Yield (event_type, value) from the push stream. Event types
+        (DuepuntozeroEventType): 249 ManualMode, 250 Flap, 251 FanSpeed,
+        252 OperationMode, 253 RoomTemperature, 254 Setpoint, 255 PowerState.
+        Values arrive as 2-byte big-endian Modbus registers."""
+        token = await self._ensure_token()
+        metadata = [("authorization", f"Bearer {token}"), ("mac_address", mac)]
+        async with self._get_stream_channel().request(
+            "/device_controls.Controls/SubscribeToDeviceEvents",
+            Cardinality.UNARY_STREAM, RawMessage, RawMessage,
+            metadata=metadata,
+        ) as stream:
+            await stream.send_message(RawMessage(b""), end=True)
+            while True:
+                # idle timeout: a half-open TCP connection would otherwise
+                # look "healthy" forever; reconnecting is one cheap RPC
+                msg = await asyncio.wait_for(
+                    stream.recv_message(), timeout=STREAM_IDLE_TIMEOUT_SECONDS)
+                if msg is None:
+                    return
+                fields = decode_message(msg.data)
+                etype = _first(fields, 1)
+                raw_val = _first(fields, 2)
+                if isinstance(raw_val, (bytes, bytearray)):
+                    value = int.from_bytes(raw_val, "big")
+                    if value >= 0x8000:  # signed 16-bit register
+                        value -= 0x10000
+                else:
+                    value = _signed(raw_val) or 0  # varint path: same sign rule
+                if etype is not None:
+                    yield etype, value
 
     async def set_value(self, mac: str, type_: int, value: int) -> None:
         _LOGGER.debug("SetDeviceValue mac=%s type=%s value=%s", mac, type_, value)

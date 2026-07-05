@@ -30,8 +30,12 @@ works for this).
   min/max/step limits
 - Room temperature sensor
 - WiFi signal diagnostic sensor
-- Cloud polling every 60 seconds (the unit has no local API — a full port
-  scan confirms the WiFi module is outbound-only)
+- **Instant push updates** via the cloud's gRPC event stream (sub-second:
+  changes made in the app appear in HA immediately), with a gentle
+  reconciliation poll (5 min while the stream is healthy, 1 min otherwise)
+- Re-authentication flow if your password changes
+- No local API exists on these units (a full port scan confirms the WiFi
+  module is outbound-only) — cloud is the only path
 
 ## Installation
 

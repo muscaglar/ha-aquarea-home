@@ -6,7 +6,9 @@ REST_BASE = "https://api.aquarea-home.solutiontech.tech/api"
 GRPC_HOST = "grpc.aquarea-home.solutiontech.tech"
 GRPC_PORT = 443
 
-UPDATE_INTERVAL_SECONDS = 60
+UPDATE_INTERVAL_SECONDS = 60          # reconciliation poll when stream is down
+STREAM_HEALTHY_POLL_SECONDS = 300     # gentle poll while push stream is live
+STREAM_IDLE_TIMEOUT_SECONDS = 900     # reconnect stream if silent this long
 
 # SetDeviceValue opcodes (DuepuntozeroValueType from the app)
 OP_POWER = 1
