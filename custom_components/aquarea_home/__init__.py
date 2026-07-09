@@ -11,6 +11,7 @@ from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import AquareaHomeClient, AuthError
@@ -25,13 +26,17 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
     reconciliation: 300s while the stream is healthy, 60s when it is not."""
 
     def __init__(self, hass: HomeAssistant, client: AquareaHomeClient,
-                 devices: list[dict]) -> None:
+                 devices: list[dict], entry_id: str) -> None:
         super().__init__(
             hass, _LOGGER, name=DOMAIN,
             update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS),
         )
         self.client = client
         self.devices = devices
+        # last-good-state cache: survives restarts through poll outages —
+        # RestoreEntity can't help when the entity was already unavailable
+        # at shutdown (learned the hard way, 2026-07-09)
+        self._store: Store = Store(hass, 1, f"{DOMAIN}.{entry_id}.state")
         # lost-update protection: events that land while a poll is in
         # flight must win over the poll's older snapshot, per field
         self._event_seq = 0
@@ -40,6 +45,15 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
         self._poll_failures = 0
         self._stream_up = False
         self._partial_poll = False
+
+    async def async_load_cache(self) -> None:
+        cached = await self._store.async_load()
+        if cached:
+            self.data = cached
+            _LOGGER.debug("seeded state from cache for %s", list(cached))
+
+    def _save_cache(self) -> None:
+        self._store.async_delay_save(lambda: self.data or {}, 30)
 
     def _sync_poll_interval(self) -> None:
         """Single owner of the poll cadence: gentle only while the stream
@@ -81,6 +95,7 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
         # cancel/reschedule the reconciliation poll on every event (starving
         # it) and silently cancel pending debounced refreshes
         self.data = data
+        self._save_cache()
         self.async_update_listeners()
 
     async def stream_events(self, mac: str) -> None:
@@ -197,6 +212,8 @@ class AquareaHomeCoordinator(DataUpdateCoordinator):
                 for field, (seq, value) in fields.items():
                     if seq > start_seq:
                         data[mac][field] = value
+        self.data = data
+        self._save_cache()
         return data
 
 
@@ -216,7 +233,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not devices:
         _LOGGER.warning("No devices found in Aquarea Home account")
 
-    coordinator = AquareaHomeCoordinator(hass, client, devices)
+    coordinator = AquareaHomeCoordinator(hass, client, devices, entry.entry_id)
+    await coordinator.async_load_cache()
     await coordinator.async_config_entry_first_refresh()
 
     for dev in devices:

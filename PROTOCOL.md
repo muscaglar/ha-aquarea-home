@@ -144,3 +144,16 @@ Decoded live (probe_status.py):
 - Integration v0.2.5: partial polls merge over last-known state (transport counts
   as healthy), climate availability gates on 'power' knowledge, RestoreEntity
   seeds state across restarts, events keep everything live.
+
+## Recovery learnings (2026-07-09 afternoon)
+
+- Cold-start blindness: HA's RestoreEntity only snapshots the state at shutdown —
+  if the entity was already unavailable then, restarts stay blind until an event.
+  v0.2.6 adds a coordinator-level persistent last-good cache (helpers.storage)
+  saved on every update/event, loaded before first refresh.
+- Write-echo bootstrap: our own SetDeviceValue commands come back as stream
+  events — re-asserting known state through the integration (or the app)
+  populates a blind session field-by-field. Useful manual recovery technique.
+- Event delivery to a reconnecting subscriber appeared delayed during heavy
+  multi-client testing; a config-entry reload (fresh subscription) resolved it.
+  Multi-subscriber semantics post-backend-change remain unverified.
