@@ -10,9 +10,10 @@ import asyncio
 import base64
 import json
 import logging
+import ssl
 import struct
 import time
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 from grpclib.client import Channel
@@ -22,6 +23,7 @@ from .const import (
     GRPC_HOST,
     GRPC_PORT,
     REST_BASE,
+    STREAM_CONNECT_TIMEOUT_SECONDS,
     STREAM_IDLE_TIMEOUT_SECONDS,
 )
 
@@ -183,6 +185,7 @@ class AquareaHomeClient:
         self._token_exp: float = 0
         self._channel: Channel | None = None
         self._stream_channel: Channel | None = None
+        self._ssl: ssl.SSLContext | None = None
 
     # ---------------- REST ----------------
 
@@ -244,16 +247,31 @@ class AquareaHomeClient:
 
     # ---------------- gRPC ----------------
 
-    def _get_channel(self) -> Channel:
+    @staticmethod
+    def _build_ssl_context() -> ssl.SSLContext:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["h2"])
+        return ctx
+
+    async def _ensure_ssl(self) -> ssl.SSLContext:
+        # loading CA certs does blocking disk I/O — keep it off the event loop
+        ctx = self._ssl
+        if ctx is None:
+            ctx = await asyncio.get_running_loop().run_in_executor(
+                None, self._build_ssl_context)
+            self._ssl = ctx
+        return ctx
+
+    def _get_channel(self, ctx: ssl.SSLContext) -> Channel:
         if self._channel is None:
-            self._channel = Channel(GRPC_HOST, GRPC_PORT, ssl=True)
+            self._channel = Channel(GRPC_HOST, GRPC_PORT, ssl=ctx)
         return self._channel
 
-    def _get_stream_channel(self) -> Channel:
+    def _get_stream_channel(self, ctx: ssl.SSLContext) -> Channel:
         # event streams get their own channel: a unary error must never
         # tear down the connection under a live subscription
         if self._stream_channel is None:
-            self._stream_channel = Channel(GRPC_HOST, GRPC_PORT, ssl=True)
+            self._stream_channel = Channel(GRPC_HOST, GRPC_PORT, ssl=ctx)
         return self._stream_channel
 
     def _close_unary_channel(self) -> None:
@@ -268,10 +286,11 @@ class AquareaHomeClient:
             self._stream_channel = None
 
     async def _unary(self, method: str, payload: bytes, mac: str) -> bytes:
+        ctx = await self._ensure_ssl()
         token = await self._ensure_token()
         metadata = [("authorization", f"Bearer {token}"), ("mac_address", mac)]
         try:
-            async with self._get_channel().request(
+            async with self._get_channel(ctx).request(
                 method, Cardinality.UNARY_UNARY, RawMessage, RawMessage,
                 metadata=metadata, timeout=25,
             ) as stream:
@@ -285,22 +304,37 @@ class AquareaHomeClient:
             raise
 
     async def get_status(self, mac: str) -> dict[str, Any]:
+        """May return a PARTIAL status: since the 2026-07-09 backend change,
+        GetDeviceStatus often carries only the iot section (fw/wifi) with no
+        main/climate block. The coordinator decides how to merge — the event
+        stream is the authoritative source for climate state."""
         raw = await self._unary("/device_controls.Controls/GetDeviceStatus", b"", mac)
         return parse_status(raw)
 
-    async def subscribe_events(self, mac: str):
+    async def subscribe_events(self, mac: str,
+                               on_connect: Callable[[], None] | None = None):
         """Yield (event_type, value) from the push stream. Event types
         (DuepuntozeroEventType): 249 ManualMode, 250 Flap, 251 FanSpeed,
         252 OperationMode, 253 RoomTemperature, 254 Setpoint, 255 PowerState.
         Values arrive as 2-byte big-endian Modbus registers."""
+        ctx = await self._ensure_ssl()
         token = await self._ensure_token()
         metadata = [("authorization", f"Bearer {token}"), ("mac_address", mac)]
-        async with self._get_stream_channel().request(
+        async with self._get_stream_channel(ctx).request(
             "/device_controls.Controls/SubscribeToDeviceEvents",
             Cardinality.UNARY_STREAM, RawMessage, RawMessage,
             metadata=metadata,
         ) as stream:
             await stream.send_message(RawMessage(b""), end=True)
+            # server headers = subscription accepted; an idle device sends
+            # no events, so this is the only connect signal we get. Short
+            # timeout: a wedged connect must not park the task for the
+            # 900s idle threshold
+            await asyncio.wait_for(
+                stream.recv_initial_metadata(),
+                timeout=STREAM_CONNECT_TIMEOUT_SECONDS)
+            if on_connect is not None:
+                on_connect()
             while True:
                 # idle timeout: a half-open TCP connection would otherwise
                 # look "healthy" forever; reconnecting is one cheap RPC

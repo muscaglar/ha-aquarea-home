@@ -13,7 +13,7 @@ into Home Assistant. Started 2026-07-05.
   an OEM discriminator.
 - The unit itself: WiFi, **zero open TCP ports** (full 65k scan) — cloud + BLE
   provisioning only. Local control impossible (short of BLE RE).
-- Device on LAN: <device-lan-ip>, MAC `AA:BB:CC:DD:EE:FF`, serial `%INXXXXXXXX`,
+- Device on LAN: 10.12.1.254, MAC `DC:1E:D5:68:E4:18`, serial `%IN25101721`,
   firmware 50, "Device type 2.0".
 
 ## REST API
@@ -120,3 +120,27 @@ Decoded live (probe_status.py):
   min/max/step from device), room temp + RSSI sensors, 60s polling via grpclib (pure python)
 - TODO for the public release: SubscribeToDeviceEvents push updates, reauth flow,
   multi-device testing, HACS metadata, publish to muscaglar/ha-aquarea-home
+
+## Flap semantics (probed live 2026-07-07)
+
+- Flap (opcode 5 / event 250) is **binary**: `1` = swinging (louvre rotation), `0` = fixed/stopped.
+- Writes of 2–8 are accepted by the RPC but the backend clamps state back to `1` — there is NO
+  positional louvre control in this protocol (matches the app, which only offers a swing toggle).
+- Exposed in HA as climate swing_mode on/off since v0.2.4.
+
+## Backend change 2026-07-09 (~10:28 BST) — GetDeviceStatus crippled, stream authoritative
+
+- `GetDeviceStatus` now returns ONLY the iot section (fw/wifi/rssi) — the whole
+  `main_status.duepuntozero_status` block is absent, regardless of request body
+  (empty and all field-flag variants tested), regardless of an open subscription.
+- REST login/topology, `SetDeviceValue` (ACKs), and `SubscribeToDeviceEvents` all
+  fully functional; live events verified end-to-end (setpoint change in the app
+  arrived as event 254 within a second).
+- `/api/homes` carries topology only — no state summary. The official app runs
+  stream-first with local caching; it never needed the poll's climate block.
+- Server reflection: UNIMPLEMENTED.
+- App "Boost" fan setting == wire fan_speed 3 (identical to Max/high; verified by
+  event capture — Boost→Max→Boost emits a single 251=3 with no further events).
+- Integration v0.2.5: partial polls merge over last-known state (transport counts
+  as healthy), climate availability gates on 'power' knowledge, RestoreEntity
+  seeds state across restarts, events keep everything live.
