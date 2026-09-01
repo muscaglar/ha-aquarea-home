@@ -157,3 +157,63 @@ Decoded live (probe_status.py):
 - Event delivery to a reconnecting subscriber appeared delayed during heavy
   multi-client testing; a config-entry reload (fresh subscription) resolved it.
   Multi-subscriber semantics post-backend-change remain unverified.
+
+
+## ✅ v2 API — 2026-09-01 (v0.3.0)
+
+On 2026-08-31 ~21:20 UTC the v1 login (`POST api.aquarea-home.solutiontech.tech/api/users/login`)
+started answering `500 {"code":402,"message":"Something went wrong, please try again later"}`
+for every request — correct password, wrong password and non-existent accounts alike — while
+`GET /api/users/me` without a token still answered `401 {"code":314}`. The sibling Innova v1
+host kept working, the Aquarea Home Android app had shipped 3.1.0 four days earlier, and the
+v2 backend accepted the same credentials, so v1 login was treated as dead and the integration
+was ported. The v1 gRPC service rejects v2 tokens (`UNAUTHENTICATED: InvalidAudience`), so
+there is no half-way migration.
+
+Reference for the v2 wire format: buenaonda/innova-farna-ha (`docs/PROTOCOL.md`), reverse-
+engineered from `tech.solutiontech.innova` 3.0.0; validated here against the RAC Solo.
+
+### Endpoints
+- REST base `https://v2.api.aquarea-home.solutiontech.tech/app/`
+  - `POST users/login {"email","password"}` → `{"token","user"}`; JWT (PS256), `aud: user-api`,
+    **exp = 365 days**. Bad password → `401 {"code":1304,"message":"Invalid credentials"}`.
+  - `GET homes` (Bearer) → homes → rooms → devices `{macAddress, nodeId, name, uid{vendorId,
+    productId, hwRevision}, serialNumber, roomId}`. Missing/invalid token → `401 {"code":1302}`.
+- gRPC `v2.grpc.aquarea-home.solutiontech.tech:443` (TLS/h2), service `services.app.AppService`,
+  metadata `authorization: Bearer <token>` only (no `mac_address` metadata; the MAC rides in the
+  request). `v2.grpc.innova.solutiontech.tech` refuses Aquarea Home tokens.
+
+### SendDevice (unary) — read state
+`DeviceRequest{ bytes mac_address = 1 (6 raw bytes); uint32 node_id = 2 (omitted when 0);
+Command request = 3 }` with `Command{ shared = 2 { get_state = 1 {} } }`
+→ request bytes for the RAC Solo: `0a06dc1ed568e4181a0412020a00`.
+
+Response (observed 2026-09-01, unit off, cool, fan high, flap on, room 22.9 °C):
+```
+2.1.1           device
+  .1            metadata: 2 = fw (50), 3 = serial "%IN25101721",
+                4.2.1 = wifi { 1 = ssid "Velop", 2 = rssi int64 (-68) }
+  .2.2.1        AC block:
+                  2 = power (bool varint, absent = off)
+                  3 = setpoint { 1 value, 2 min, 3 max, 4 step }  floats, °C (19.0/16.0/31.0/0.5)
+                  4 = mode     { 1 value, 3 = packed options [1,2,3,4,5] }
+                  5 = fan      { 1 value, 2 = packed options [2,3,4,5,1] }
+                  6 = flap (1 = swinging)
+                  7 = room temperature (float)
+```
+Enums (confirmed live, same as Innova FÄRNA): hvac_mode 1=auto 2=heat 3=cool 4=dry 5=fan_only;
+fan_speed 1=auto 2=low 3=medium 4=high 5=max (the RAC Solo now exposes five fan levels; v1 had
+four). A response carrying field 1 and no field 2 is an error wrapper (code 1 =
+RESPONSE_TIMEOUT: the cloud cannot reach the unit).
+
+### SendDevice — control
+`Command{ ac = 3 { set_state = 1 AcSetState } }`,
+`AcSetState{ bool power = 1; float temperature_setpoint = 2; int32 hvac_mode = 3;
+int32 fan_speed = 4; bool flap_swing = 5 }`. **Partial updates work**: a setpoint-only write
+while the unit was off changed the setpoint and left power off (verified 2026-09-01, 19.0 →
+19.5 → 19.0).
+
+### Not used yet
+`SubscribeEvents(SubscribeRequest{home_id = raw 16-byte UUID}) → stream Event` exists (delta
+events only, no replay on subscribe). Its event schema for the 2.0 family has not been decoded;
+v0.3.0 polls every 30 s instead and re-polls 2 s after each command.

@@ -1,7 +1,6 @@
-"""Climate entity for Aquarea Home RAC Solo (duepuntozero) devices."""
+"""Climate entity for Aquarea Home AC units (RAC Solo / Innova 2.0)."""
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -20,21 +19,21 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import AquareaHomeCoordinator
 from .const import (
     DOMAIN,
-    FAN_AUTO, FAN_MAX, FAN_MEDIUM, FAN_MIN,
+    FAN_AUTO, FAN_HIGH, FAN_LOW, FAN_MAX, FAN_MEDIUM,
     MODE_AUTO, MODE_COOL, MODE_DRY, MODE_FAN, MODE_HEAT,
-    OP_FAN, OP_FLAP, OP_MODE, OP_POWER, OP_SETPOINT,
 )
 
 MODE_TO_HVAC = {
     MODE_AUTO: HVACMode.AUTO,
     MODE_HEAT: HVACMode.HEAT,
     MODE_COOL: HVACMode.COOL,
-    MODE_FAN: HVACMode.FAN_ONLY,
     MODE_DRY: HVACMode.DRY,
+    MODE_FAN: HVACMode.FAN_ONLY,
 }
 HVAC_TO_MODE = {v: k for k, v in MODE_TO_HVAC.items()}
 
-FAN_TO_HA = {FAN_AUTO: "auto", FAN_MIN: "low", FAN_MEDIUM: "medium", FAN_MAX: "high"}
+FAN_TO_HA = {FAN_AUTO: "auto", FAN_LOW: "low", FAN_MEDIUM: "medium",
+             FAN_HIGH: "high", FAN_MAX: "max"}
 HA_TO_FAN = {v: k for k, v in FAN_TO_HA.items()}
 
 
@@ -48,19 +47,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
 
 class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntity,
                          RestoreEntity):
-    """The RAC Solo as a thermostat. Stream-first since v0.2.5: polls may
-    lack the climate section (backend change 2026-07-09), so state is
-    restored across restarts and kept live by push events."""
+    """The AC unit as a thermostat. Mode and fan lists come from the unit's
+    own option lists when the cloud reports them."""
 
     _attr_has_entity_name = True
     _attr_name = None
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.AUTO, HVACMode.HEAT,
-                        HVACMode.COOL, HVACMode.FAN_ONLY, HVACMode.DRY]
-    _attr_fan_modes = ["auto", "low", "medium", "high"]
-    # flap is binary on this unit (probed 2026-07-07: values 2-8 are clamped
-    # to 1 by the backend) — 1 = swinging, 0 = fixed. No positional control
-    # exists in the protocol.
+    # flap is binary on this unit — 1 = swinging, 0 = fixed. No positional
+    # control exists in the protocol.
     _attr_swing_modes = ["on", "off"]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
@@ -73,6 +67,7 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
     def __init__(self, coordinator: AquareaHomeCoordinator, device: dict) -> None:
         super().__init__(coordinator)
         self._mac = device["mac"]
+        self._node_id = device.get("node_id", 0)
         self._attr_unique_id = f"{DOMAIN}_{self._mac}_climate"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._mac)},
@@ -89,15 +84,13 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
 
     @property
     def available(self) -> bool:
-        # gate on actual climate knowledge, not just any payload — a poll
-        # carrying only the iot/wifi section must not present as a live
-        # thermostat with phantom values
+        # gate on actual climate knowledge, not just any payload
         return super().available and "power" in self._status
 
     async def async_added_to_hass(self) -> None:
-        """Seed climate state from the recorder when the poll can't provide
-        it — the event stream then corrects anything stale on first change
-        (room temperature events arrive within minutes on their own)."""
+        """Seed climate state from the recorder if the first poll has not
+        delivered it yet (e.g. a cloud outage at startup); the next good
+        poll corrects anything stale."""
         await super().async_added_to_hass()
         if "power" in self._status:
             return
@@ -128,6 +121,16 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
         data[self._mac] = status
         self.coordinator.data = data
         self.async_write_ha_state()
+
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        opts = self._status.get("mode_options") or list(MODE_TO_HVAC)
+        return [HVACMode.OFF] + [MODE_TO_HVAC[o] for o in opts if o in MODE_TO_HVAC]
+
+    @property
+    def fan_modes(self) -> list[str]:
+        opts = self._status.get("fan_options") or list(FAN_TO_HA)
+        return [FAN_TO_HA[o] for o in opts if o in FAN_TO_HA]
 
     @property
     def hvac_mode(self) -> HVACMode | None:
@@ -166,29 +169,22 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
             return None
         return "on" if flap else "off"
 
-    async def _send(self, type_: int, value: int) -> None:
-        await self.coordinator.client.set_value(self._mac, type_, value)
-
-    async def _refresh_soon(self) -> None:
-        await asyncio.sleep(2)
-        await self.coordinator.async_request_refresh()
+    async def _command(self, optimistic: dict[str, Any], **fields: Any) -> None:
+        await self.coordinator.async_command(self._mac, self._node_id, optimistic, **fields)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            await self._send(OP_POWER, 0)
-        else:
-            if not self._status.get("power"):
-                await self._send(OP_POWER, 1)
-            await self._send(OP_MODE, HVAC_TO_MODE[hvac_mode])
-        await self._refresh_soon()
+            await self._command({"power": False}, power=False)
+            return
+        mode = HVAC_TO_MODE[hvac_mode]
+        await self._command({"power": True, "operation_mode": mode},
+                            power=True, hvac_mode=mode)
 
     async def async_turn_on(self) -> None:
-        await self._send(OP_POWER, 1)
-        await self._refresh_soon()
+        await self._command({"power": True}, power=True)
 
     async def async_turn_off(self) -> None:
-        await self._send(OP_POWER, 0)
-        await self._refresh_soon()
+        await self._command({"power": False}, power=False)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         # the climate component does NOT handle hvac_mode for platforms —
@@ -200,13 +196,14 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
             await self.async_set_hvac_mode(HVACMode(hvac_mode))
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is not None:
-            await self._send(OP_SETPOINT, round(float(temp) * 10))
-            await self._refresh_soon()
+            step = self.target_temperature_step or 0.5
+            value = round(round(float(temp) / step) * step, 2)
+            await self._command({"setpoint": value}, setpoint=value)
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        await self._send(OP_FAN, HA_TO_FAN[fan_mode])
-        await self._refresh_soon()
+        fan = HA_TO_FAN[fan_mode]
+        await self._command({"fan_speed": fan}, fan_speed=fan)
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
-        await self._send(OP_FLAP, 1 if swing_mode == "on" else 0)
-        await self._refresh_soon()
+        on = swing_mode == "on"
+        await self._command({"flap": 1 if on else 0}, flap_swing=on)

@@ -25,14 +25,22 @@ works for this).
 
 ## What you get
 
+> **v0.3.0 (2026-09-01): moved to the v2 cloud API.** SolutionTech's original
+> (v1) login endpoint stopped working on 2026-08-31 — every login, valid or
+> not, returns `500 {"code": 402}` — while the v2 API that the current
+> Aquarea Home / Innova apps use kept working with the same credentials.
+> Existing installs keep their entities and device; a restart after the
+> update is all that is needed.
+
 - `climate` entity — power, HVAC modes (auto/heat/cool/fan/dry), fan speed
-  (auto/low/medium/high), target temperature with the device's real
+  (auto/low/medium/high/max), target temperature with the device's real
   min/max/step limits
 - Room temperature sensor
 - WiFi signal diagnostic sensor
-- **Instant push updates** via the cloud's gRPC event stream (sub-second:
-  changes made in the app appear in HA immediately), with a gentle
-  reconciliation poll (5 min while the stream is healthy, 1 min otherwise)
+- State refreshed every 30 s from the cloud, with an immediate re-poll after
+  every command (changes made in the app appear in HA within half a minute)
+- The login token is persisted (v2 tokens are valid for a year), so a Home
+  Assistant restart never depends on the login endpoint being up
 - Re-authentication flow if your password changes
 - No local API exists on these units (a full port scan confirms the WiFi
   module is outbound-only) — cloud is the only path
@@ -59,7 +67,7 @@ discovered from your account automatically.
 ## Notes & etiquette
 
 - This talks to an **undocumented third-party cloud**
-  (`api.aquarea-home.solutiontech.tech`, operated by SolutionTech, the
+  (`v2.api.aquarea-home.solutiontech.tech` / `v2.grpc.aquarea-home.solutiontech.tech`, operated by SolutionTech, the
   developer of the official app). It may break without notice if the
   backend changes.
 - The integration polls gently (60 s) and reuses tokens. Don't lower the
