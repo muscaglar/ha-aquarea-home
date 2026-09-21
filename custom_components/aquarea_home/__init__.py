@@ -1,4 +1,4 @@
-"""Aquarea Home (Panasonic RAC Solo / Innova) integration — v2 cloud API."""
+"""Aquarea Home (Panasonic RAC Solo) integration — v2 cloud API."""
 from __future__ import annotations
 
 import asyncio

@@ -45,19 +45,18 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Two checks are ignored, each only until its cause is fixed:
+          # One check is ignored until its cause is fixed:
           #   brands - there is no custom_components/aquarea_home/brand/icon.png
           #   in this repo and the domain is not in home-assistant/brands.
           #   Since HA 2026.3 custom integrations ship their own images, so
           #   adding brand/icon.png (256x256) is the way to pass. Drop "brands"
           #   when the icon lands.
-          #   topics - the repository has no topics yet. They are a repository
-          #   setting (About > Topics), not a commit. Drop "topics" once they
-          #   are set.
           # Everything else stays enforced: archived, description, hacsjson,
-          # information, integration_manifest, issues, license.
+          # information, integration_manifest, issues, license, topics.
+          # Topics are a repository setting (About > Topics), not a commit:
+          # if they are ever cleared, this job fails.
           # One space-separated string; the action does not take a YAML list.
-          ignore: brands topics
+          ignore: brands
 
   tests:
     name: pytest
