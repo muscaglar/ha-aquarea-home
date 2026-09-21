@@ -11,6 +11,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -52,6 +53,8 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
 
     _attr_has_entity_name = True
     _attr_name = None
+    # only there to give the non-standard "max" fan mode a label
+    _attr_translation_key = "ac"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     # flap is binary on this unit — 1 = swinging, 0 = fixed. No positional
     # control exists in the protocol.
@@ -176,6 +179,10 @@ class AquareaHomeClimate(CoordinatorEntity[AquareaHomeCoordinator], ClimateEntit
         if hvac_mode == HVACMode.OFF:
             await self._command({"power": False}, power=False)
             return
+        if hvac_mode not in self.hvac_modes:
+            # climate.set_temperature passes hvac_mode through unchecked
+            raise ServiceValidationError(
+                f"HVAC mode {hvac_mode} is not supported by this unit")
         mode = HVAC_TO_MODE[hvac_mode]
         await self._command({"power": True, "operation_mode": mode},
                             power=True, hvac_mode=mode)

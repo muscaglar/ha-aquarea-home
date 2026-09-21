@@ -37,7 +37,31 @@ class AuthError(AquareaHomeError):
 
 
 class DeviceOffline(AquareaHomeError):
-    """The cloud cannot reach the unit right now."""
+    """The cloud answered, but not with this unit's state (unit unreachable,
+    node error, no AC block). Says nothing about the other units."""
+
+
+class UnitForbidden(DeviceOffline):
+    """The cloud refuses this unit to the account (removed or unshared)."""
+
+
+class RequestTimeout(DeviceOffline):
+    """No reply in time. Usually one slow unit; the poller treats a run of
+    these with nothing answering as the cloud itself being down."""
+
+
+class UnitError(DeviceOffline):
+    """The cloud answered this unit's request with a gRPC error status."""
+
+
+class BadReply(DeviceOffline):
+    """The cloud answered for this unit with something the codec cannot read."""
+
+
+# DeviceMessage.Response.Error.Code and shared NodeError — names from the
+# schema recovered by the hass-innova-cloud project (MIT)
+RESPONSE_ERRORS = {1: "RESPONSE_TIMEOUT", 2: "CACHE_NOT_READY"}
+NODE_ERRORS = {1: "OFFLINE", 2: "CACHE_NOT_READY", 3: "INTERNAL"}
 
 
 class RawMessage:
@@ -70,6 +94,10 @@ def _read_varint(buf: bytes, i: int) -> tuple[int, int]:
 
 
 def _write_varint(value: int) -> bytes:
+    if value < 0:
+        # the loop below never ends for a negative int; nothing in this API
+        # is signed on the write side
+        raise ValueError(f"cannot encode negative varint {value}")
     out = bytearray()
     while True:
         bits = value & 0x7F
@@ -103,31 +131,35 @@ def decode_message(buf: bytes) -> dict[int, list[Any]]:
 
     Length-delimited fields come back as raw bytes for the caller to
     interpret; fixed32 fields are decoded as IEEE floats (the only fixed32
-    values this API uses are temperatures)."""
+    values this API uses are temperatures). Malformed input raises
+    AquareaHomeError, never IndexError/struct.error."""
     out: dict[int, list[Any]] = {}
     i = 0
     n = len(buf)
-    while i < n:
-        tag, i = _read_varint(buf, i)
-        fnum, wt = tag >> 3, tag & 7
-        if wt == 0:
-            v, i = _read_varint(buf, i)
-        elif wt == 1:
-            v = struct.unpack("<q", buf[i:i + 8])[0]
-            i += 8
-        elif wt == 5:
-            v = struct.unpack("<f", buf[i:i + 4])[0]
-            i += 4
-        elif wt == 2:
-            ln, i = _read_varint(buf, i)
-            if i + ln > n:
-                raise AquareaHomeError(
-                    f"truncated length-delimited field {fnum}: need {ln}, have {n - i}")
-            v = buf[i:i + ln]
-            i += ln
-        else:
-            raise AquareaHomeError(f"unsupported wire type {wt} on field {fnum}")
-        out.setdefault(fnum, []).append(v)
+    try:
+        while i < n:
+            tag, i = _read_varint(buf, i)
+            fnum, wt = tag >> 3, tag & 7
+            if wt == 0:
+                v, i = _read_varint(buf, i)
+            elif wt == 1:
+                v = struct.unpack("<q", buf[i:i + 8])[0]
+                i += 8
+            elif wt == 5:
+                v = struct.unpack("<f", buf[i:i + 4])[0]
+                i += 4
+            elif wt == 2:
+                ln, i = _read_varint(buf, i)
+                if i + ln > n:
+                    raise AquareaHomeError(
+                        f"truncated length-delimited field {fnum}: need {ln}, have {n - i}")
+                v = buf[i:i + ln]
+                i += ln
+            else:
+                raise AquareaHomeError(f"unsupported wire type {wt} on field {fnum}")
+            out.setdefault(fnum, []).append(v)
+    except (IndexError, struct.error) as err:
+        raise AquareaHomeError(f"malformed protobuf reply: {err}") from err
     return out
 
 
@@ -156,9 +188,12 @@ def _packed_varints(buf: Any) -> list[int]:
     data = bytes(buf)
     out: list[int] = []
     i = 0
-    while i < len(data):
-        v, i = _read_varint(data, i)
-        out.append(v)
+    try:
+        while i < len(data):
+            v, i = _read_varint(data, i)
+            out.append(v)
+    except IndexError as err:
+        raise AquareaHomeError(f"malformed packed field: {err}") from err
     return out
 
 
@@ -215,27 +250,53 @@ def build_set_state(mac: str, node_id: int = 0, *, power: bool | None = None,
     return req + _ld(3, command)
 
 
-def parse_state(raw: bytes) -> dict[str, Any]:
+def _error_text(err: dict[int, list[Any]]) -> str:
+    """Response.Error{code(1), message(2)?} as readable text."""
+    code = _first(err, 1, 0)
+    name = RESPONSE_ERRORS.get(code, f"error code {code}")
+    text = _text(_first(err, 2))
+    return f"{name}: {text}" if text else name
+
+
+def _pick_node(state: dict[int, list[Any]], node_id: int) -> dict[int, list[Any]] | None:
+    """State.nodes is map<node_id, Node>, on the wire one {1: key, 2: Node}
+    entry per node. Take the entry for node_id; single-node units (every RAC
+    Solo seen so far) just have the one entry, whatever its key."""
+    entries = [decode_message(bytes(e)) for e in state.get(2, [])
+               if isinstance(e, (bytes, bytearray))]
+    if not entries:
+        return None
+    for entry in entries:
+        if _first(entry, 1, 0) == node_id:
+            return _sub(entry, 2)
+    return _sub(entries[0], 2)
+
+
+def parse_state(raw: bytes, node_id: int = 0) -> dict[str, Any]:
     """Parse a SendDevice(get_state) response for an AC (RAC Solo / Innova
     2.0) unit into a flat status dict.
 
     Layout (field numbers, observed live 2026-09-01):
-      resp.2.1.1 = device
+      resp.2.1.1 = state
         .1 = metadata {2: fw, 3: serial, 4: {2: {1: {1: ssid, 2: rssi(int64)}}}}
-        .2.2.1 = AC block {2: power, 3: setpoint{1 value,2 min,3 max,4 step},
-                          4: mode{1 value, 3: packed options},
-                          5: fan{1 value, 2: packed options},
-                          6: flap, 7: room temperature}
+        .2 = nodes map entry {1: node_id, 2: Node}
+          Node.1 = AC block {2: power, 3: setpoint{1 value,2 min,3 max,4 step},
+                             4: mode{1 value, 3: packed options},
+                             5: fan{1 value, 2: packed options},
+                             6: flap, 7: room temperature}
+          Node.6 = NodeError instead of a state
     A response with field 1 and no field 2 is an error wrapper (e.g. code 1
-    = RESPONSE_TIMEOUT): the cloud could not reach the unit."""
+    = RESPONSE_TIMEOUT): the cloud could not reach the unit.
+
+    Raises DeviceOffline whenever the reply does not carry this unit's AC
+    state, so a reply without it is never mistaken for a good poll."""
     root = decode_message(raw)
     if 2 not in root:
-        err = _sub(root, 1)
-        raise DeviceOffline(f"cloud could not reach the unit (error {dict(err) or 'empty'})")
-    dev = _sub(_sub(_sub(root, 2), 1), 1)
+        raise DeviceOffline(f"cloud could not reach the unit ({_error_text(_sub(root, 1))})")
+    state = _sub(_sub(_sub(root, 2), 1), 1)
     status: dict[str, Any] = {}
 
-    meta = _sub(dev, 1)
+    meta = _sub(state, 1)
     if meta:
         status["fw_version"] = _first(meta, 2)
         status["serial_number"] = _text(_first(meta, 3))
@@ -244,30 +305,38 @@ def parse_state(raw: bytes) -> dict[str, Any]:
             status["wifi_ssid"] = _text(_first(wifi, 1))
             status["wifi_rssi"] = _signed(_first(wifi, 2))
 
-    ac = _sub(_sub(_sub(dev, 2), 2), 1)
-    if ac:
-        status["power"] = bool(_first(ac, 2, 0))
-        sp = _sub(ac, 3)
-        if sp:
-            status["setpoint"] = round(float(_first(sp, 1, 0.0)), 1)
-            status["setpoint_min"] = round(float(_first(sp, 2, 16.0)), 1)
-            status["setpoint_max"] = round(float(_first(sp, 3, 31.0)), 1)
-            status["setpoint_step"] = round(float(_first(sp, 4, 0.5)), 2)
-        mode = _sub(ac, 4)
-        status["operation_mode"] = _first(mode, 1, 0)
-        opts = _packed_varints(_first(mode, 3))
-        if opts:
-            status["mode_options"] = opts
-        fan = _sub(ac, 5)
-        status["fan_speed"] = _first(fan, 1, 0)
-        opts = _packed_varints(_first(fan, 2))
-        if opts:
-            status["fan_options"] = opts
-        if 6 in ac:
-            status["flap"] = _first(ac, 6)
-        room = _first(ac, 7)
-        if isinstance(room, float):
-            status["room_temperature"] = round(room, 1)
+    node = _pick_node(state, node_id)
+    if node is None:
+        raise DeviceOffline("reply carries no node state")
+    if 1 not in node:
+        if 6 in node:
+            code = _first(node, 6, 0)
+            raise DeviceOffline(f"unit reports {NODE_ERRORS.get(code, f'node error {code}')}")
+        raise DeviceOffline(f"not an AC node (node fields {sorted(node) or 'none'})")
+
+    ac = _sub(node, 1)
+    status["power"] = bool(_first(ac, 2, 0))
+    sp = _sub(ac, 3)
+    if sp:
+        status["setpoint"] = round(float(_first(sp, 1, 0.0)), 1)
+        status["setpoint_min"] = round(float(_first(sp, 2, 16.0)), 1)
+        status["setpoint_max"] = round(float(_first(sp, 3, 31.0)), 1)
+        status["setpoint_step"] = round(float(_first(sp, 4, 0.5)), 2)
+    mode = _sub(ac, 4)
+    status["operation_mode"] = _first(mode, 1, 0)
+    opts = _packed_varints(_first(mode, 3))
+    if opts:
+        status["mode_options"] = opts
+    fan = _sub(ac, 5)
+    status["fan_speed"] = _first(fan, 1, 0)
+    opts = _packed_varints(_first(fan, 2))
+    if opts:
+        status["fan_options"] = opts
+    if 6 in ac:
+        status["flap"] = _first(ac, 6)
+    room = _first(ac, 7)
+    if isinstance(room, float):
+        status["room_temperature"] = round(room, 1)
     return status
 
 
@@ -302,19 +371,28 @@ class AquareaHomeClient:
                 headers={"User-Agent": USER_AGENT},
                 timeout=REST_TIMEOUT,
             ) as resp:
-                body = await resp.json(content_type=None)
-                if resp.status == 401:
-                    raise AuthError(body.get("message", "invalid credentials")
-                                    if isinstance(body, dict) else "invalid credentials")
-                if resp.status != 200:
-                    raise AquareaHomeError(f"login failed: {resp.status} {body}")
+                status = resp.status
+                try:
+                    body = await resp.json(content_type=None)
+                except ValueError:
+                    # an HTML error page from a proxy in front of the backend
+                    body = None
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise AquareaHomeError(f"login network error: {err}") from err
-        token = body.get("token") if isinstance(body, dict) else None
+        if not isinstance(body, dict):
+            body = {}
+        if status == 401:
+            raise AuthError(str(body.get("message") or "invalid credentials"))
+        if status != 200:
+            # only the backend's own error code: never echo a whole body
+            # from the login endpoint into an exception (and so the log)
+            raise AquareaHomeError(f"login failed: HTTP {status} (code {body.get('code')})")
+        token = body.get("token")
         if not token:
             raise AquareaHomeError("login response had no token")
         self._token = token
-        return body.get("user", {})
+        user = body.get("user")
+        return user if isinstance(user, dict) else {}
 
     async def get_devices(self) -> list[dict[str, Any]]:
         """Flat device list from the homes topology (identity only; live
@@ -332,13 +410,26 @@ class AquareaHomeClient:
                     raise AuthError(f"token rejected (HTTP {resp.status})")
                 if resp.status != 200:
                     raise AquareaHomeError(f"GET homes -> HTTP {resp.status}")
-                homes = await resp.json(content_type=None)
+                try:
+                    homes = await resp.json(content_type=None)
+                except ValueError as err:
+                    raise AquareaHomeError("GET homes -> non-JSON reply") from err
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise AquareaHomeError(f"homes network error: {err}") from err
+        if homes is None:
+            homes = []
+        if not isinstance(homes, list):
+            raise AquareaHomeError("GET homes -> unexpected reply shape")
         devices: list[dict[str, Any]] = []
-        for home in homes or []:
-            rooms = {r.get("id"): r.get("name") for r in home.get("rooms") or []}
+        for home in homes:
+            if not isinstance(home, dict):
+                continue
+            rooms = {r.get("id"): r.get("name") for r in home.get("rooms") or []
+                     if isinstance(r, dict)}
             for dev in home.get("devices") or []:
+                if not isinstance(dev, dict) or not dev.get("macAddress"):
+                    _LOGGER.debug("skipping a homes entry without a MAC address")
+                    continue
                 devices.append({
                     "mac": dev["macAddress"],
                     "node_id": dev.get("nodeId") or 0,
@@ -377,16 +468,27 @@ class AquareaHomeClient:
             self._channel.close()
             self._channel = None
 
+    def _drop_channel(self, channel: Channel) -> None:
+        """Close the channel a failed call used so the next call reconnects.
+        A newer channel that another call has opened since is left alone."""
+        if self._channel is channel:
+            self._channel = None
+        channel.close()
+
     def close(self) -> None:
         self._close_channel()
 
     async def _send_device(self, payload: bytes) -> bytes:
+        """One SendDevice round trip. Only AquareaHomeError subclasses leave
+        this method: AuthError (token), DeviceOffline (this unit), anything
+        else (the path to the cloud)."""
         if not self._token:
             await self.login()
         ctx = await self._ensure_ssl()
         metadata = [("authorization", f"Bearer {self._token}")]
+        channel = self._get_channel(ctx)
         try:
-            async with self._get_channel(ctx).request(
+            async with channel.request(
                 f"{GRPC_SERVICE}/SendDevice", Cardinality.UNARY_UNARY,
                 RawMessage, RawMessage, metadata=metadata, timeout=GRPC_TIMEOUT,
             ) as stream:
@@ -394,30 +496,54 @@ class AquareaHomeClient:
                 reply = await stream.recv_message()
                 return reply.data if reply else b""
         except GRPCError as err:
-            # drop a possibly-wedged channel so the next call reconnects
-            self._close_channel()
-            if err.status in (Status.UNAUTHENTICATED, Status.PERMISSION_DENIED):
-                raise AuthError(f"gRPC {err.status.name}: {err.message}") from err
-            if err.status in (Status.UNAVAILABLE, Status.DEADLINE_EXCEEDED):
-                raise DeviceOffline(f"gRPC {err.status.name}: {err.message}") from err
-            raise AquareaHomeError(f"gRPC {err.status.name}: {err.message}") from err
-        except (OSError, asyncio.TimeoutError, StreamTerminatedError,
-                ConnectionError) as err:
-            self._close_channel()
+            text = f"gRPC {err.status.name}: {err.message}"
+            # the server answered, so the channel is fine for these
+            if err.status is Status.UNAUTHENTICATED:
+                raise AuthError(text) from err
+            if err.status in (Status.PERMISSION_DENIED, Status.NOT_FOUND):
+                raise UnitForbidden(text) from err
+            if err.status is Status.DEADLINE_EXCEEDED:
+                self._drop_channel(channel)    # possibly wedged
+                raise RequestTimeout(text) from err
+            if err.status in (Status.UNAVAILABLE, Status.RESOURCE_EXHAUSTED,
+                              Status.UNIMPLEMENTED):
+                # the cloud or its load balancer: asking for the next unit
+                # would only get the same answer
+                self._drop_channel(channel)
+                raise AquareaHomeError(text) from err
+            raise UnitError(text) from err
+        except asyncio.TimeoutError as err:
+            self._drop_channel(channel)
+            raise RequestTimeout(f"no reply within {GRPC_TIMEOUT} s") from err
+        except (OSError, StreamTerminatedError) as err:
+            self._drop_channel(channel)
             raise AquareaHomeError(f"gRPC transport error: {err}") from err
+        except Exception as err:  # noqa: BLE001 — h2 / grpclib protocol errors
+            self._drop_channel(channel)
+            raise AquareaHomeError(
+                f"gRPC unexpected error: {type(err).__name__}: {err}") from err
 
     async def get_state(self, mac: str, node_id: int = 0) -> dict[str, Any]:
-        """Live status of one unit. Raises DeviceOffline when the cloud
-        cannot reach it."""
+        """Live status of one unit. Raises DeviceOffline when the reply does
+        not carry its state."""
         raw = await self._send_device(build_get_state(mac, node_id))
-        return parse_state(raw)
+        try:
+            return parse_state(raw, node_id)
+        except DeviceOffline:
+            raise
+        except (AquareaHomeError, ValueError, TypeError, OverflowError) as err:
+            # the schema is reverse-engineered: a field that changes type
+            # must cost this unit a poll, not every unit a traceback
+            raise BadReply(f"unreadable get_state reply: {err}") from err
 
     async def set_state(self, mac: str, node_id: int = 0, **fields: Any) -> None:
         """Partial AcSetState write: power / setpoint / hvac_mode /
         fan_speed / flap_swing."""
         _LOGGER.debug("set_state mac=%s %s", mac, fields)
         raw = await self._send_device(build_set_state(mac, node_id, **fields))
-        root = decode_message(raw) if raw else {}
+        try:
+            root = decode_message(raw) if raw else {}
+        except AquareaHomeError as err:
+            raise BadReply(f"unreadable set_state reply: {err}") from err
         if root and 2 not in root and 1 in root:
-            raise DeviceOffline(
-                f"command not delivered (error {dict(_sub(root, 1)) or 'empty'})")
+            raise DeviceOffline(f"command not delivered ({_error_text(_sub(root, 1))})")
