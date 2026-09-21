@@ -1,0 +1,9 @@
+# Test-only dependencies. Home Assistant is absent on purpose: the tests run
+# against the small stand-ins set up in tests/conftest.py, so this installs in
+# seconds and does not break with each HA release.
+pytest
+pytest-asyncio
+aiohttp
+# Keep in step with "requirements" in custom_components/aquarea_home/manifest.json,
+# so the tests run against what users get installed.
+grpclib>=0.4.9,<0.5
