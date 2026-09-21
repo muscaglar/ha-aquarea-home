@@ -1,6 +1,6 @@
 {
   "domain": "aquarea_home",
-  "name": "Aquarea Home (Panasonic RAC Solo / Innova)",
+  "name": "Aquarea Home (Panasonic RAC Solo)",
   "codeowners": ["@muscaglar"],
   "config_flow": true,
   "dependencies": [],
