@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+.pytest_cache/
+
+# HACS copies everything tracked under custom_components/ straight into users'
+# config directories, so hidden files and directories must never be committed
+# there. A deny rule rather than an allow-list: new real files (services.yaml,
+# icons.json, brand/) still show up in `git status` instead of vanishing.
+custom_components/**/.*

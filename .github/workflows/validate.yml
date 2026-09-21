@@ -1,0 +1,74 @@
+name: Validate
+
+# Packaging checks (hassfest, HACS) and offline unit tests. Nothing in here
+# talks to the Panasonic cloud or needs a secret, so it is safe on forks and
+# pull requests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 05:17 UTC. hassfest follows Home Assistant's dev branch, so the
+    # weekly run is how new packaging rules surface before a user reports them.
+    # GitHub disables scheduled workflows after 60 days without repository
+    # activity - if the weekly runs stop appearing, re-enable the workflow
+    # from the Actions tab.
+    - cron: "17 5 * * 1"
+  # Manual run: topics and description are repository settings, not commits,
+  # so changing them never triggers a run on its own.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a pull request cancels the run in progress; runs on main
+  # and the weekly run are left to finish.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      # hassfest reads the integration from the workspace.
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout: the action reads the repository through the GitHub API.
+      - uses: hacs/action@main
+        with:
+          category: integration
+          # Two checks are ignored, each only until its cause is fixed:
+          #   brands - there is no custom_components/aquarea_home/brand/icon.png
+          #   in this repo and the domain is not in home-assistant/brands.
+          #   Since HA 2026.3 custom integrations ship their own images, so
+          #   adding brand/icon.png (256x256) is the way to pass. Drop "brands"
+          #   when the icon lands.
+          #   topics - the repository has no topics yet. They are a repository
+          #   setting (About > Topics), not a commit. Drop "topics" once they
+          #   are set.
+          # Everything else stays enforced: archived, description, hacsjson,
+          # information, integration_manifest, issues, license.
+          # One space-separated string; the action does not take a YAML list.
+          ignore: brands topics
+
+  tests:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Home Assistant is not installed on purpose: tests/conftest.py provides
+      # the small stand-ins the tests need, so this job installs in seconds
+      # and does not break with each HA release.
+      - run: pip install -r requirements-test.txt
+      - run: pytest -q
