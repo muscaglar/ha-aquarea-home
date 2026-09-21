@@ -43,6 +43,12 @@ class _Base(CoordinatorEntity[AquareaHomeCoordinator], SensorEntity):
     def _status(self) -> dict:
         return (self.coordinator.data or {}).get(self._mac, {})
 
+    @property
+    def available(self) -> bool:
+        # a unit the cloud cannot reach is left out of the data; its sensors
+        # must read unavailable, not unknown, while the other units carry on
+        return super().available and self._mac in (self.coordinator.data or {})
+
 
 class RoomTemperatureSensor(_Base):
     _attr_device_class = SensorDeviceClass.TEMPERATURE

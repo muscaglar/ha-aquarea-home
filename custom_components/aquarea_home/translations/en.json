@@ -19,11 +19,26 @@
     },
     "error": {
       "invalid_auth": "Invalid email or password",
-      "cannot_connect": "Could not reach the Aquarea Home cloud"
+      "cannot_connect": "Could not reach the Aquarea Home cloud",
+      "unknown": "Unexpected error; see the Home Assistant log"
     },
     "abort": {
       "already_configured": "This account is already configured",
-      "reauth_successful": "Re-authentication successful"
+      "reauth_successful": "Re-authentication successful",
+      "no_devices_found": "No devices were found in this Aquarea Home account"
+    }
+  },
+  "entity": {
+    "climate": {
+      "ac": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "max": "Max"
+            }
+          }
+        }
+      }
     }
   }
 }

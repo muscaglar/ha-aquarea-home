@@ -12,6 +12,18 @@ GRPC_SERVICE = "/services.app.AppService"
 
 UPDATE_INTERVAL_SECONDS = 30          # get_state poll cadence
 COMMAND_REFRESH_DELAY_SECONDS = 2     # re-poll after a command lands
+# consecutive misses a unit rides out on its last-known state before its
+# entities go unavailable (the backend browns out for a few minutes at a time)
+POLL_FAILURE_GRACE = 3
+# a token rejected again right after a fresh login is the backend's problem,
+# not the password's: don't hammer the login endpoint every poll
+RELOGIN_MIN_INTERVAL_SECONDS = 600
+# a login endpoint that is down is not asked again on every 30 s poll either;
+# short enough that the retry still lands inside the three-poll grace
+LOGIN_RETRY_SECONDS = 60
+# every unit answering PERMISSION_DENIED may be the token's doing, or the
+# units really are gone from the account: worth one fresh login a day
+FORBIDDEN_RELOGIN_SECONDS = 86400
 
 # AcSetState.hvac_mode / AcState hvac_mode (v2 enum, confirmed live)
 MODE_AUTO = 1

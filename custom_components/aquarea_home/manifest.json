@@ -8,6 +8,7 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/muscaglar/ha-aquarea-home/issues",
-  "requirements": ["grpclib==0.4.9"],
-  "version": "0.3.0"
+  "loggers": ["grpclib"],
+  "requirements": ["grpclib>=0.4.9,<0.5"],
+  "version": "0.3.1"
 }

@@ -1,14 +1,18 @@
 """Config flow for Aquarea Home."""
 from __future__ import annotations
 
+import logging
+
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import AquareaHomeClient, AuthError
+from .api import AquareaHomeClient, AquareaHomeError, AuthError
 from .const import DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
 
 SCHEMA = vol.Schema({
     vol.Required(CONF_EMAIL): str,
@@ -37,8 +41,12 @@ class AquareaHomeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await client.login()
             except AuthError:
                 errors["base"] = "invalid_auth"
-            except Exception:  # noqa: BLE001
+            except AquareaHomeError as err:
+                _LOGGER.warning("Aquarea Home login failed: %s", err)
                 errors["base"] = "cannot_connect"
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error during Aquarea Home login")
+                errors["base"] = "unknown"
             else:
                 self.hass.config_entries.async_update_entry(
                     entry, data={**entry.data,
@@ -65,11 +73,19 @@ class AquareaHomeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 devices = await client.get_devices()
             except AuthError:
                 errors["base"] = "invalid_auth"
-            except Exception:  # noqa: BLE001
+            except AquareaHomeError as err:
+                _LOGGER.warning("Aquarea Home login failed: %s", err)
                 errors["base"] = "cannot_connect"
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Unexpected error during Aquarea Home login")
+                errors["base"] = "unknown"
             else:
                 await self.async_set_unique_id(user_input[CONF_EMAIL].lower())
                 self._abort_if_unique_id_configured()
+                if not devices:
+                    # the device list is only read at setup: an entry made
+                    # now would stay empty
+                    return self.async_abort(reason="no_devices_found")
                 title = devices[0]["name"] if len(devices) == 1 else "Aquarea Home"
                 return self.async_create_entry(title=title, data=user_input)
         return self.async_show_form(step_id="user", data_schema=SCHEMA, errors=errors)
